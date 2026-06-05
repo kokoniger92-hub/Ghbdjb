@@ -4,7 +4,7 @@ from flask import Flask, request
 app = Flask(__name__)
 
 # ===== НАСТРОЙКИ (ЗАМЕНИ ТОКЕН И ADMIN ID) =====
-TOKEN = "СЮДА_ВСТАВЬ_НОВЫЙ_ТОКЕН"
+TOKEN = "8897748741:AAG2f8sHicGX_wxGEBPm2gqgbULhkGp4weE"
 ADMIN = 5979001063  # твой Telegram ID (узнай у @userinfobot)
 # ===============================================
 
