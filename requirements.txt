@@ -4,3 +4,4 @@ beautifulsoup4==4.12.2
 lxml==4.9.3
 flask==2.3.3
 webdriver-manager==4.0.1
+gunicorn==21.2.0
