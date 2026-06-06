@@ -6,7 +6,7 @@ import os
 import logging
 from datetime import datetime
 from threading import Thread
-from flask import Flask
+from flask import Flask, jsonify
 from aiogram import Bot, Dispatcher, types
 from aiogram.contrib.middlewares.logging import LoggingMiddleware
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
@@ -32,30 +32,31 @@ SEARCH_QUERIES = [
 ]
 
 CHECK_INTERVAL = 300  # 5 минут
+PORT = int(os.getenv("PORT", 10000))  # Render требует порт
 # ===============================
 
 # Настройка логов
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Flask для пингов
+# Flask приложение для health check
 flask_app = Flask(__name__)
 
 @flask_app.route('/')
 def health_check():
-    return "✅ Бот для поиска сим-карт работает!", 200
+    return jsonify({"status": "ok", "message": "Бот для поиска сим-карт работает"}), 200
 
-@flask_app.route('/webhook/<token>')
-def webhook(token):
-    if token == BOT_TOKEN:
-        return "OK", 200
-    return "Unauthorized", 403
+@flask_app.route('/health')
+def health():
+    return jsonify({"status": "alive"}), 200
 
 def run_flask():
-    flask_app.run(host='0.0.0.0', port=10000)
+    """Запускает Flask сервер на нужном порту"""
+    flask_app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
 
 # Запускаем Flask в отдельном потоке
-Thread(target=run_flask, daemon=True).start()
+flask_thread = Thread(target=run_flask, daemon=True)
+flask_thread.start()
 
 # Инициализация бота
 bot = Bot(token=BOT_TOKEN)
@@ -81,20 +82,26 @@ def create_driver():
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     )
     
-    try:
-        service = Service("/usr/bin/chromedriver")
-        driver = webdriver.Chrome(service=service, options=chrome_options)
-        return driver
-    except:
+    # Пробуем разные пути к Chrome на Render
+    paths = ["/usr/bin/chromedriver", "/usr/bin/chromium-browser", "/usr/bin/chromium"]
+    for path in paths:
         try:
-            service = Service("/usr/bin/chromium-browser")
+            service = Service(path)
             driver = webdriver.Chrome(service=service, options=chrome_options)
+            logger.info(f"✅ Драйвер создан: {path}")
             return driver
         except:
-            from webdriver_manager.chrome import ChromeDriverManager
-            service = Service(ChromeDriverManager().install())
-            driver = webdriver.Chrome(service=service, options=chrome_options)
-            return driver
+            continue
+    
+    # Если ничего не работает, используем webdriver-manager
+    try:
+        from webdriver_manager.chrome import ChromeDriverManager
+        service = Service(ChromeDriverManager().install())
+        driver = webdriver.Chrome(service=service, options=chrome_options)
+        return driver
+    except Exception as e:
+        logger.error(f"❌ Не удалось создать драйвер: {e}")
+        raise
 
 def check_balance_in_text(text):
     """Проверяет упоминание баланса 400"""
@@ -228,7 +235,6 @@ async def check_all_for_user(user_id, min_price, max_price):
         logger.info(f"✅ Проверка для {user_id} завершена. Найдено: {len(all_items)}")
         
         if len(notified_products) > 1000:
-            # Очищаем старые записи (но не все)
             to_remove = list(notified_products)[:500]
             for key in to_remove:
                 notified_products.remove(key)
@@ -245,7 +251,7 @@ async def periodic_check():
         try:
             for user_id, settings in user_settings.items():
                 await check_all_for_user(user_id, settings['min_price'], settings['max_price'])
-                await asyncio.sleep(10)  # Пауза между пользователями
+                await asyncio.sleep(10)
         except Exception as e:
             logger.error(f"Ошибка в periodic_check: {e}")
         await asyncio.sleep(CHECK_INTERVAL)
@@ -314,7 +320,6 @@ async def stats_cmd(message: types.Message):
     user_id = message.from_user.id
     settings = user_settings.get(user_id, {'min_price': DEFAULT_MIN_PRICE, 'max_price': DEFAULT_MAX_PRICE})
     
-    # Считаем сколько уведомлений для этого пользователя
     user_notifications = sum(1 for key in notified_products if key.startswith(str(user_id)))
     
     await message.answer(
@@ -338,13 +343,10 @@ async def process_callback(callback_query: CallbackQuery):
     if data == "set_min":
         await bot.send_message(user_id, "✏️ Введи *минимальную цену* в рублях (например: 1):", parse_mode="Markdown")
         await bot.answer_callback_query(callback_query.id)
-        # Устанавливаем состояние ожидания ввода
-        dp.register_message_handler(lambda m: set_min_price(m, user_id), lambda m: m.text and m.text.isdigit())
         
     elif data == "set_max":
         await bot.send_message(user_id, "✏️ Введи *максимальную цену* в рублях (например: 60):", parse_mode="Markdown")
         await bot.answer_callback_query(callback_query.id)
-        dp.register_message_handler(lambda m: set_max_price(m, user_id), lambda m: m.text and m.text.isdigit())
         
     elif data == "show_range":
         settings = user_settings[user_id]
@@ -375,52 +377,63 @@ async def process_callback(callback_query: CallbackQuery):
         await check_all_for_user(user_id, user_settings[user_id]['min_price'], user_settings[user_id]['max_price'])
         await msg.edit_text(f"✅ Ручная проверка завершена!")
 
-async def set_min_price(message: types.Message, user_id):
-    """Устанавливает минимальную цену"""
-    try:
-        min_price = int(message.text)
-        if min_price < 0:
-            await message.answer("❌ Цена не может быть отрицательной! Введи число от 0 до 1000:")
-            return
-        
-        user_settings[user_id]['min_price'] = min_price
-        
-        # Проверяем что min <= max
-        if user_settings[user_id]['min_price'] > user_settings[user_id]['max_price']:
-            user_settings[user_id]['max_price'] = min_price + 100
-        
-        await message.answer(
-            f"✅ Минимальная цена установлена: {min_price} ₽\n\n"
-            f"💰 Текущий диапазон: {user_settings[user_id]['min_price']} - {user_settings[user_id]['max_price']} ₽",
-            reply_markup=get_settings_keyboard(user_id)
-        )
-    except ValueError:
-        await message.answer("❌ Введи корректное число!")
+# Обработчики для ввода цены
+@dp.message_handler(lambda message: message.text and message.text.isdigit() and message.from_user.id in user_settings)
+async def handle_price_input(message: types.Message):
+    user_id = message.from_user.id
+    value = int(message.text)
+    
+    # Проверяем, что мы ожидаем ввод (простой способ - хранить состояние)
+    # Для простоты будем считать, что последний callback был на установку мин/макс цены
+    # Но для надежности используем временное хранилище
+    if not hasattr(handle_price_input, 'waiting_for'):
+        handle_price_input.waiting_for = {}
+    
+    if user_id in handle_price_input.waiting_for:
+        action = handle_price_input.waiting_for[user_id]
+        if action == 'min':
+            user_settings[user_id]['min_price'] = value
+            if user_settings[user_id]['min_price'] > user_settings[user_id]['max_price']:
+                user_settings[user_id]['max_price'] = value + 100
+            await message.answer(
+                f"✅ Минимальная цена установлена: {value} ₽\n\n"
+                f"💰 Текущий диапазон: {user_settings[user_id]['min_price']} - {user_settings[user_id]['max_price']} ₽",
+                reply_markup=get_settings_keyboard(user_id)
+            )
+        elif action == 'max':
+            user_settings[user_id]['max_price'] = value
+            if user_settings[user_id]['min_price'] > user_settings[user_id]['max_price']:
+                user_settings[user_id]['min_price'] = value - 100 if value > 100 else 1
+            await message.answer(
+                f"✅ Максимальная цена установлена: {value} ₽\n\n"
+                f"💰 Текущий диапазон: {user_settings[user_id]['min_price']} - {user_settings[user_id]['max_price']} ₽",
+                reply_markup=get_settings_keyboard(user_id)
+            )
+        del handle_price_input.waiting_for[user_id]
+    else:
+        await message.answer("❌ Сначала выбери, что хочешь изменить (Мин. цену или Макс. цену)")
 
-async def set_max_price(message: types.Message, user_id):
-    """Устанавливает максимальную цену"""
-    try:
-        max_price = int(message.text)
-        if max_price < 0:
-            await message.answer("❌ Цена не может быть отрицательной! Введи число от 0 до 1000:")
-            return
-        
-        user_settings[user_id]['max_price'] = max_price
-        
-        # Проверяем что min <= max
-        if user_settings[user_id]['min_price'] > user_settings[user_id]['max_price']:
-            user_settings[user_id]['min_price'] = max_price - 100 if max_price > 100 else 1
-        
-        await message.answer(
-            f"✅ Максимальная цена установлена: {max_price} ₽\n\n"
-            f"💰 Текущий диапазон: {user_settings[user_id]['min_price']} - {user_settings[user_id]['max_price']} ₽",
-            reply_markup=get_settings_keyboard(user_id)
-        )
-    except ValueError:
-        await message.answer("❌ Введи корректное число!")
+# Обновляем callback-обработчики для установки состояния ожидания
+@dp.callback_query_handler(lambda c: c.data == "set_min")
+async def set_min_callback(callback_query: CallbackQuery):
+    user_id = callback_query.from_user.id
+    if not hasattr(handle_price_input, 'waiting_for'):
+        handle_price_input.waiting_for = {}
+    handle_price_input.waiting_for[user_id] = 'min'
+    await bot.send_message(user_id, "✏️ Введи *минимальную цену* в рублях (например: 1):", parse_mode="Markdown")
+    await bot.answer_callback_query(callback_query.id)
+
+@dp.callback_query_handler(lambda c: c.data == "set_max")
+async def set_max_callback(callback_query: CallbackQuery):
+    user_id = callback_query.from_user.id
+    if not hasattr(handle_price_input, 'waiting_for'):
+        handle_price_input.waiting_for = {}
+    handle_price_input.waiting_for[user_id] = 'max'
+    await bot.send_message(user_id, "✏️ Введи *максимальную цену* в рублях (например: 60):", parse_mode="Markdown")
+    await bot.answer_callback_query(callback_query.id)
 
 if __name__ == "__main__":
-    logger.info("🚀 Бот запущен!")
+    logger.info(f"🚀 Бот запущен на порту {PORT}")
     logger.info(f"🔍 Отслеживаем сим-карты с балансом 400₽")
     
     # Запускаем фоновую проверку
