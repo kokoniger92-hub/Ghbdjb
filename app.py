@@ -4,7 +4,9 @@ import asyncio
 from datetime import datetime
 from flask import Flask, jsonify
 from aiogram import Bot, Dispatcher, types
-from aiogram.utils import executor
+from aiogram.filters import Command
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from aiogram.utils.keyboard import ReplyKeyboardBuilder
 
 # ========== КОНФИГ ==========
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8897748741:AAG2f8sHicGX_wxGEBPm2gqgbULhkGp4weE")
@@ -15,15 +17,23 @@ PORT = int(os.getenv("PORT", 10000))
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Flask приложение
+# Flask
 flask_app = Flask(__name__)
 
 # Бот
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(bot)
+dp = Dispatcher()
+
+# Клавиатура
+keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="/check"), KeyboardButton(text="/help")]
+    ],
+    resize_keyboard=True
+)
 
 # ========== КОМАНДЫ БОТА ==========
-@dp.message_handler(commands=['start'])
+@dp.message(Command("start"))
 async def start_cmd(message: types.Message):
     await message.answer(
         f"🤖 *Бот для поиска сим-карт запущен!*\n\n"
@@ -32,15 +42,16 @@ async def start_cmd(message: types.Message):
         f"⏱ *Проверка:* вручную по команде /check\n\n"
         f"✅ Бот работает стабильно!\n"
         f"🔍 Нажми /check для поиска",
-        parse_mode="Markdown"
+        parse_mode="Markdown",
+        reply_markup=keyboard
     )
     logger.info(f"Пользователь {message.from_user.id} запустил бота")
 
-@dp.message_handler(commands=['check'])
+@dp.message(Command("check"))
 async def check_cmd(message: types.Message):
     status_msg = await message.answer("🔄 *Поиск сим-карт...*\n\nЭто может занять несколько секунд", parse_mode="Markdown")
     
-    # Имитация поиска (в реальности здесь будет парсинг)
+    # Имитация загрузки
     await asyncio.sleep(2)
     
     # Отправляем результат
@@ -59,7 +70,7 @@ async def check_cmd(message: types.Message):
     
     await status_msg.edit_text("✅ *Поиск завершён!*\n\nНайдено предложений: 1", parse_mode="Markdown")
 
-@dp.message_handler(commands=['help'])
+@dp.message(Command("help"))
 async def help_cmd(message: types.Message):
     await message.answer(
         f"📖 *Команды бота:*\n\n"
@@ -74,7 +85,7 @@ async def help_cmd(message: types.Message):
         parse_mode="Markdown"
     )
 
-@dp.message_handler()
+@dp.message()
 async def unknown_cmd(message: types.Message):
     await message.answer(
         f"❓ *Неизвестная команда*\n\n"
@@ -82,12 +93,18 @@ async def unknown_cmd(message: types.Message):
         parse_mode="Markdown"
     )
 
+# ========== ФУНКЦИЯ ЗАПУСКА ==========
+async def main():
+    # Запускаем бота
+    await dp.start_polling(bot)
+
 # ========== FLASK ДЛЯ HEALTH CHECK ==========
 @flask_app.route('/')
 def index():
     return jsonify({
         "status": "ok",
         "bot": "running",
+        "version": "aiogram3",
         "timestamp": datetime.now().isoformat()
     })
 
@@ -109,6 +126,7 @@ if __name__ == "__main__":
     logger.info(f"🚀 Бот запущен на порту {PORT}")
     logger.info(f"🤖 Токен: {BOT_TOKEN[:20]}...")
     logger.info(f"👤 Admin ID: {ADMIN_CHAT_ID}")
+    logger.info(f"📦 Версия: aiogram 3")
     
     # Запускаем бота
-    executor.start_polling(dp, skip_updates=True)
+    asyncio.run(main())
