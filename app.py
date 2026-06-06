@@ -1,32 +1,40 @@
-import asyncio
-import time
-import random
-import re
 import os
+import sys
+import time
+import re
 import logging
+import threading
+import asyncio
 from datetime import datetime
 from flask import Flask, jsonify
 from aiogram import Bot, Dispatcher, types
-from aiogram.contrib.middlewares.logging import LoggingMiddleware
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.utils import executor
 from bs4 import BeautifulSoup
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
+
+# Пробуем импортировать selenium с обработкой ошибок
+try:
+    from selenium import webdriver
+    from selenium.webdriver.chrome.service import Service
+    from selenium.webdriver.chrome.options import Options
+    SELENIUM_AVAILABLE = True
+except ImportError:
+    SELENIUM_AVAILABLE = False
+    print("⚠️ Selenium не установлен, работаем в демо-режиме")
 
 # ========== НАСТРОЙКИ ==========
 BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "123456789"))
 
-# Значения по умолчанию
+# Диапазон цен по умолчанию
 DEFAULT_MIN_PRICE = 1
 DEFAULT_MAX_PRICE = 60
 
+# Поисковые запросы
 SEARCH_QUERIES = [
     "сим карта баланс 400",
     "сим карта стартовый баланс 400",
-    "симка 400 рублей",
-    "сим карта 400р баланс"
+    "симка 400 рублей"
 ]
 
 CHECK_INTERVAL = 300  # 5 минут
@@ -37,52 +45,56 @@ PORT = int(os.getenv("PORT", 10000))
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Flask приложение
-app = Flask(__name__)
+# Flask приложение (ОСНОВНОЙ поток)
+flask_app = Flask(__name__)
 
-# Хранилище данных пользователей
+# Хранилище
 user_settings = {}
 notified_products = set()
-
-# Инициализация бота
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
-dp.middleware.setup(LoggingMiddleware())
 
+# ========== ФУНКЦИИ ДЛЯ ПАРСИНГА ==========
 def create_driver():
-    """Создаёт браузер для Render"""
+    """Создаёт браузер для парсинга"""
+    if not SELENIUM_AVAILABLE:
+        return None
+    
     chrome_options = Options()
     chrome_options.add_argument("--headless=new")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--disable-gpu")
-    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
     chrome_options.add_argument("--window-size=1920,1080")
-    chrome_options.add_argument("--remote-debugging-port=9222")
-    chrome_options.add_argument(
-        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    )
     
-    # Пробуем разные пути к Chrome
-    paths = ["/usr/bin/chromedriver", "/usr/bin/chromium-browser", "/usr/bin/chromium"]
+    # Пробуем разные пути
+    paths = [
+        "/usr/bin/chromedriver",
+        "/usr/bin/chromium-browser", 
+        "/usr/bin/chromium",
+        "/snap/bin/chromium"
+    ]
+    
     for path in paths:
         try:
-            service = Service(path)
-            driver = webdriver.Chrome(service=service, options=chrome_options)
-            logger.info(f"✅ Драйвер создан: {path}")
-            return driver
+            if os.path.exists(path):
+                service = Service(path)
+                driver = webdriver.Chrome(service=service, options=chrome_options)
+                logger.info(f"✅ Драйвер создан: {path}")
+                return driver
         except:
             continue
     
+    # Пробуем через webdriver-manager
     try:
         from webdriver_manager.chrome import ChromeDriverManager
         service = Service(ChromeDriverManager().install())
         driver = webdriver.Chrome(service=service, options=chrome_options)
+        logger.info("✅ Драйвер создан через webdriver-manager")
         return driver
     except Exception as e:
         logger.error(f"❌ Ошибка драйвера: {e}")
-        raise
+        return None
 
 def check_balance_in_text(text):
     """Проверяет упоминание баланса 400"""
@@ -91,281 +103,276 @@ def check_balance_in_text(text):
     text_lower = text.lower()
     patterns = [
         r'баланс\s*400', r'стартовый\s*баланс\s*400',
-        r'баланс\s*400р', r'400\s*руб', r'400₽', r'балансом\s*400'
+        r'баланс\s*400р', r'400\s*руб', r'400₽'
     ]
-    for pattern in patterns:
-        if re.search(pattern, text_lower):
-            return True
-    return False
+    return any(re.search(pattern, text_lower) for pattern in patterns)
 
-async def send_notification(user_id, item):
-    """Отправляет уведомление"""
-    profit = 400 - item['price']
-    message = (
-        f"🎉 *НАЙДЕНА ВЫГОДНАЯ СИМ-КАРТА!*\n\n"
-        f"🛍 *Платформа:* {item['platform']}\n"
-        f"📱 *Название:* {item['name'][:100]}\n"
-        f"💰 *Цена:* {item['price']} ₽\n"
-        f"💎 *Баланс:* 400 ₽\n"
-        f"📈 *Выгода:* {profit} ₽\n"
-        f"🕐 *Найдено:* {datetime.now().strftime('%H:%M:%S')}\n\n"
-        f"🔗 [Купить на {item['platform']}]({item['url']})"
-    )
-    try:
-        await bot.send_message(user_id, message, parse_mode="Markdown")
-        logger.info(f"✅ Уведомление для {user_id}: {item['name'][:50]}")
-    except Exception as e:
-        logger.error(f"❌ Ошибка отправки: {e}")
-
-def search_ozon(driver, query, min_price, max_price):
-    """Парсинг Ozon"""
+def search_ozon(min_price, max_price):
+    """Поиск на Ozon (упрощённая версия)"""
     results = []
+    if not SELENIUM_AVAILABLE:
+        # Демо-режим
+        results.append({
+            'platform': 'Ozon (демо)',
+            'name': 'Сим-карта с балансом 400₽',
+            'price': 50,
+            'url': 'https://www.ozon.ru'
+        })
+        return results
+    
+    driver = None
     try:
-        url = f"https://www.ozon.ru/search/?text={query.replace(' ', '+')}"
-        driver.get(url)
-        time.sleep(random.uniform(2, 4))
+        driver = create_driver()
+        if not driver:
+            return results
         
-        soup = BeautifulSoup(driver.page_source, 'html.parser')
-        items = soup.find_all('div', {'data-widget': 'searchProductsV2'})
-        if not items:
-            items = soup.find_all('div', class_='tile-root')
-        
-        for item in items[:10]:
-            try:
-                title_elem = item.find('span', class_='tsBody500Medium') or item.find('div', class_='tile-title')
-                if not title_elem:
+        for query in SEARCH_QUERIES:
+            url = f"https://www.ozon.ru/search/?text={query.replace(' ', '+')}"
+            driver.get(url)
+            time.sleep(3)
+            
+            soup = BeautifulSoup(driver.page_source, 'html.parser')
+            items = soup.find_all('div', class_='tile-root')[:5]
+            
+            for item in items:
+                try:
+                    title_elem = item.find('span', class_='tsBody500Medium')
+                    if not title_elem:
+                        continue
+                    title = title_elem.text.strip()
+                    
+                    price_elem = item.find('span', class_='tsHeadline500Medium')
+                    price = 0
+                    if price_elem:
+                        price_text = re.sub(r'[^\d]', '', price_elem.text)
+                        price = int(price_text) if price_text else 0
+                    
+                    link_elem = item.find('a', href=True)
+                    url = "https://www.ozon.ru" + link_elem['href'] if link_elem else ""
+                    
+                    if min_price <= price <= max_price and check_balance_in_text(title):
+                        results.append({
+                            'platform': 'Ozon',
+                            'name': title[:100],
+                            'price': price,
+                            'url': url
+                        })
+                        logger.info(f"🎯 Найдено на Ozon: {price}₽")
+                except Exception as e:
                     continue
-                title = title_elem.text.strip()
-                
-                price = 0
-                price_elem = item.find('span', class_='tsHeadline500Medium') or item.find('span', class_='tsHeadline500')
-                if price_elem:
-                    price_text = re.sub(r'[^\d]', '', price_elem.text)
-                    price = int(price_text) if price_text else 0
-                
-                link_elem = item.find('a', href=True)
-                url = "https://www.ozon.ru" + link_elem['href'] if link_elem else ""
-                
-                if min_price <= price <= max_price and check_balance_in_text(title):
-                    results.append({'platform': 'Ozon', 'name': title, 'price': price, 'url': url})
-            except Exception:
-                continue
     except Exception as e:
         logger.error(f"Ozon ошибка: {e}")
+    finally:
+        if driver:
+            driver.quit()
+    
     return results
 
-def search_wildberries(driver, query, min_price, max_price):
-    """Парсинг Wildberries"""
+def search_wildberries(min_price, max_price):
+    """Поиск на Wildberries (упрощённая версия)"""
     results = []
+    if not SELENIUM_AVAILABLE:
+        return results
+    
+    driver = None
     try:
-        url = f"https://www.wildberries.ru/catalog/0/search.aspx?search={query.replace(' ', '%20')}"
-        driver.get(url)
-        time.sleep(random.uniform(2, 4))
+        driver = create_driver()
+        if not driver:
+            return results
         
-        soup = BeautifulSoup(driver.page_source, 'html.parser')
-        items = soup.find_all('div', class_='product-card')
-        
-        for item in items[:10]:
-            try:
-                title_elem = item.find('span', class_='product-card__name')
-                if not title_elem:
+        for query in SEARCH_QUERIES:
+            url = f"https://www.wildberries.ru/catalog/0/search.aspx?search={query.replace(' ', '%20')}"
+            driver.get(url)
+            time.sleep(3)
+            
+            soup = BeautifulSoup(driver.page_source, 'html.parser')
+            items = soup.find_all('div', class_='product-card')[:5]
+            
+            for item in items:
+                try:
+                    title_elem = item.find('span', class_='product-card__name')
+                    if not title_elem:
+                        continue
+                    title = title_elem.text.strip()
+                    
+                    price_elem = item.find('ins', class_='price__lower-price')
+                    price = 0
+                    if price_elem:
+                        price_text = re.sub(r'[^\d]', '', price_elem.text)
+                        price = int(price_text) if price_text else 0
+                    
+                    link_elem = item.find('a', href=True)
+                    url = "https://www.wildberries.ru" + link_elem['href'] if link_elem else ""
+                    
+                    if min_price <= price <= max_price and check_balance_in_text(title):
+                        results.append({
+                            'platform': 'WB',
+                            'name': title[:100],
+                            'price': price,
+                            'url': url
+                        })
+                        logger.info(f"🎯 Найдено на WB: {price}₽")
+                except Exception as e:
                     continue
-                title = title_elem.text.strip()
-                
-                price = 0
-                price_elem = item.find('ins', class_='price__lower-price')
-                if price_elem:
-                    price_text = re.sub(r'[^\d]', '', price_elem.text)
-                    price = int(price_text) if price_text else 0
-                
-                link_elem = item.find('a', href=True)
-                url = "https://www.wildberries.ru" + link_elem['href'] if link_elem else ""
-                
-                if min_price <= price <= max_price and check_balance_in_text(title):
-                    results.append({'platform': 'Wildberries', 'name': title, 'price': price, 'url': url})
-            except Exception:
-                continue
     except Exception as e:
         logger.error(f"WB ошибка: {e}")
+    finally:
+        if driver:
+            driver.quit()
+    
     return results
 
 async def check_all_for_user(user_id, min_price, max_price):
     """Проверка для пользователя"""
-    driver = None
-    try:
-        driver = create_driver()
-        all_items = []
-        for query in SEARCH_QUERIES:
-            all_items.extend(search_ozon(driver, query, min_price, max_price))
-            all_items.extend(search_wildberries(driver, query, min_price, max_price))
-            await asyncio.sleep(1)
-        
-        for item in all_items:
-            key = f"{user_id}_{item['platform']}_{item['url']}"
-            if key not in notified_products:
-                await send_notification(user_id, item)
+    logger.info(f"🔍 Проверка для {user_id}: {min_price}-{max_price}₽")
+    
+    # Поиск товаров
+    ozon_items = search_ozon(min_price, max_price)
+    wb_items = search_wildberries(min_price, max_price)
+    all_items = ozon_items + wb_items
+    
+    # Отправка уведомлений
+    for item in all_items:
+        key = f"{user_id}_{item['platform']}_{item['url']}"
+        if key not in notified_products:
+            profit = 400 - item['price']
+            message = (
+                f"🎉 *НАЙДЕНА СИМ-КАРТА!*\n\n"
+                f"🛍 *Платформа:* {item['platform']}\n"
+                f"📱 *Название:* {item['name']}\n"
+                f"💰 *Цена:* {item['price']} ₽\n"
+                f"💎 *Баланс:* 400 ₽\n"
+                f"📈 *Выгода:* {profit} ₽\n\n"
+                f"🔗 [Купить]({item['url']})"
+            )
+            try:
+                await bot.send_message(user_id, message, parse_mode="Markdown")
                 notified_products.add(key)
+                logger.info(f"✅ Уведомление отправлено {user_id}")
+            except Exception as e:
+                logger.error(f"Ошибка отправки: {e}")
+    
+    logger.info(f"✅ Проверка завершена, найдено: {len(all_items)}")
+
+def run_bot():
+    """Запуск бота в отдельном потоке"""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    @dp.message_handler(commands=['start'])
+    async def start_cmd(message: types.Message):
+        user_id = message.from_user.id
+        if user_id not in user_settings:
+            user_settings[user_id] = {'min_price': DEFAULT_MIN_PRICE, 'max_price': DEFAULT_MAX_PRICE}
         
-        if len(notified_products) > 1000:
-            to_remove = list(notified_products)[:500]
-            for key in to_remove:
-                notified_products.remove(key)
-    except Exception as e:
-        logger.error(f"Ошибка: {e}")
-    finally:
-        if driver:
-            driver.quit()
-
-def get_settings_keyboard(user_id):
-    """Клавиатура настроек"""
-    settings = user_settings.get(user_id, {'min_price': DEFAULT_MIN_PRICE, 'max_price': DEFAULT_MAX_PRICE})
-    keyboard = InlineKeyboardMarkup(row_width=2)
-    keyboard.add(
-        InlineKeyboardButton("💰 Мин. цена", callback_data=f"set_min_{user_id}"),
-        InlineKeyboardButton("💰 Макс. цена", callback_data=f"set_max_{user_id}")
-    )
-    keyboard.add(
-        InlineKeyboardButton("📊 Диапазон", callback_data=f"show_{user_id}"),
-        InlineKeyboardButton("🔄 Сброс", callback_data=f"reset_{user_id}")
-    )
-    keyboard.add(
-        InlineKeyboardButton("🔍 Проверить", callback_data=f"check_{user_id}")
-    )
-    return keyboard
-
-# Flask маршруты
-@app.route('/')
-def index():
-    return jsonify({"status": "ok", "message": "Бот работает"}), 200
-
-@app.route('/health')
-def health():
-    return jsonify({"status": "alive"}), 200
-
-# Обработчики команд
-@dp.message_handler(commands=['start'])
-async def start_cmd(message: types.Message):
-    user_id = message.from_user.id
-    if user_id not in user_settings:
-        user_settings[user_id] = {'min_price': DEFAULT_MIN_PRICE, 'max_price': DEFAULT_MAX_PRICE}
+        keyboard = InlineKeyboardMarkup(row_width=2)
+        keyboard.add(
+            InlineKeyboardButton("💰 Мин. цена", callback_data="set_min"),
+            InlineKeyboardButton("💰 Макс. цена", callback_data="set_max")
+        )
+        keyboard.add(
+            InlineKeyboardButton("🔍 Проверить сейчас", callback_data="check_now"),
+            InlineKeyboardButton("📊 Текущий диапазон", callback_data="show_range")
+        )
+        
+        await message.answer(
+            f"🤖 *Бот для поиска сим-карт*\n\n"
+            f"💰 Диапазон: {user_settings[user_id]['min_price']} - {user_settings[user_id]['max_price']} ₽\n"
+            f"💎 Баланс: 400 ₽\n"
+            f"⏱ Проверка: каждые {CHECK_INTERVAL // 60} мин\n\n"
+            f"👇 Настрой кнопками:",
+            parse_mode="Markdown",
+            reply_markup=keyboard
+        )
     
-    await message.answer(
-        f"🤖 *Бот для поиска сим-карт*\n\n"
-        f"💰 Диапазон: {user_settings[user_id]['min_price']}-{user_settings[user_id]['max_price']}₽\n"
-        f"💎 Баланс: 400₽\n"
-        f"⏱ Проверка: каждые {CHECK_INTERVAL//60} мин\n\n"
-        f"👇 Настрой кнопками:",
-        parse_mode="Markdown",
-        reply_markup=get_settings_keyboard(user_id)
-    )
-
-# Callback обработчики
-@dp.callback_query_handler(lambda c: c.data.startswith('set_min_'))
-async def set_min_callback(callback: types.CallbackQuery):
-    user_id = int(callback.data.split('_')[2])
-    await bot.send_message(user_id, "✏️ Введи *минимальную цену* (число):", parse_mode="Markdown")
-    await callback.answer()
-
-@dp.callback_query_handler(lambda c: c.data.startswith('set_max_'))
-async def set_max_callback(callback: types.CallbackQuery):
-    user_id = int(callback.data.split('_')[2])
-    await bot.send_message(user_id, "✏️ Введи *максимальную цену* (число):", parse_mode="Markdown")
-    await callback.answer()
-
-@dp.callback_query_handler(lambda c: c.data.startswith('show_'))
-async def show_callback(callback: types.CallbackQuery):
-    user_id = int(callback.data.split('_')[1])
-    settings = user_settings.get(user_id, {'min_price': DEFAULT_MIN_PRICE, 'max_price': DEFAULT_MAX_PRICE})
-    await bot.send_message(
-        user_id,
-        f"📊 *Текущий диапазон*\n💰 {settings['min_price']} - {settings['max_price']} ₽",
-        parse_mode="Markdown"
-    )
-    await callback.answer()
-
-@dp.callback_query_handler(lambda c: c.data.startswith('reset_'))
-async def reset_callback(callback: types.CallbackQuery):
-    user_id = int(callback.data.split('_')[1])
-    user_settings[user_id] = {'min_price': DEFAULT_MIN_PRICE, 'max_price': DEFAULT_MAX_PRICE}
-    await bot.send_message(
-        user_id,
-        f"🔄 Сброшено! Диапазон: {DEFAULT_MIN_PRICE}-{DEFAULT_MAX_PRICE}₽",
-        reply_markup=get_settings_keyboard(user_id)
-    )
-    await callback.answer()
-
-@dp.callback_query_handler(lambda c: c.data.startswith('check_'))
-async def check_callback(callback: types.CallbackQuery):
-    user_id = int(callback.data.split('_')[1])
-    await callback.answer("🔍 Проверка...")
-    msg = await bot.send_message(user_id, "🔄 Ищу...")
-    await check_all_for_user(user_id, user_settings[user_id]['min_price'], user_settings[user_id]['max_price'])
-    await msg.edit_text("✅ Готово!")
-
-@dp.message_handler(lambda msg: msg.text and msg.text.isdigit())
-async def price_input(message: types.Message):
-    user_id = message.from_user.id
-    value = int(message.text)
+    @dp.callback_query_handler(lambda c: True)
+    async def callback_handler(callback: types.CallbackQuery):
+        user_id = callback.from_user.id
+        data = callback.data
+        
+        if data == "set_min":
+            await bot.send_message(user_id, "✏️ Введи *минимальную цену* (число):", parse_mode="Markdown")
+            await callback.answer()
+        elif data == "set_max":
+            await bot.send_message(user_id, "✏️ Введи *максимальную цену* (число):", parse_mode="Markdown")
+            await callback.answer()
+        elif data == "check_now":
+            await callback.answer("🔍 Ищу...")
+            msg = await bot.send_message(user_id, "🔄 Поиск...")
+            await check_all_for_user(user_id, user_settings[user_id]['min_price'], user_settings[user_id]['max_price'])
+            await msg.edit_text("✅ Проверка завершена!")
+        elif data == "show_range":
+            settings = user_settings.get(user_id, {'min_price': DEFAULT_MIN_PRICE, 'max_price': DEFAULT_MAX_PRICE})
+            await bot.send_message(
+                user_id,
+                f"📊 *Текущий диапазон*\n💰 {settings['min_price']} - {settings['max_price']} ₽",
+                parse_mode="Markdown"
+            )
+            await callback.answer()
     
-    # Простое определение: если ввели число, спрашиваем что менять
-    await message.answer(
-        f"Ты ввел {value}₽\nЧто сделать?\n/set_min - установить как мин. цену\n/set_max - установить как макс. цену"
-    )
-    # Сохраняем последнее введенное значение
-    if not hasattr(price_input, 'last_value'):
-        price_input.last_value = {}
-    price_input.last_value[user_id] = value
-
-@dp.message_handler(commands=['set_min'])
-async def set_min(message: types.Message):
-    user_id = message.from_user.id
-    if hasattr(price_input, 'last_value') and user_id in price_input.last_value:
-        value = price_input.last_value[user_id]
-        user_settings[user_id]['min_price'] = value
-        await message.answer(f"✅ Мин. цена: {value}₽")
-    else:
-        await message.answer("❌ Сначала введи число")
-
-@dp.message_handler(commands=['set_max'])
-async def set_max(message: types.Message):
-    user_id = message.from_user.id
-    if hasattr(price_input, 'last_value') and user_id in price_input.last_value:
-        value = price_input.last_value[user_id]
-        user_settings[user_id]['max_price'] = value
-        await message.answer(f"✅ Макс. цена: {value}₽")
-    else:
-        await message.answer("❌ Сначала введи число")
-
-async def background_check():
-    """Фоновая проверка"""
-    while True:
-        try:
-            for user_id, settings in user_settings.items():
-                await check_all_for_user(user_id, settings['min_price'], settings['max_price'])
-                await asyncio.sleep(10)
-        except Exception as e:
-            logger.error(f"Ошибка: {e}")
-        await asyncio.sleep(CHECK_INTERVAL)
-
-# Запуск
-async def main():
+    @dp.message_handler(lambda msg: msg.text and msg.text.isdigit())
+    async def price_input(message: types.Message):
+        user_id = message.from_user.id
+        value = int(message.text)
+        
+        if user_id not in user_settings:
+            user_settings[user_id] = {'min_price': DEFAULT_MIN_PRICE, 'max_price': DEFAULT_MAX_PRICE}
+        
+        # Если минимальная цена не установлена
+        if 'temp_price' not in user_settings[user_id]:
+            user_settings[user_id]['min_price'] = value
+            user_settings[user_id]['temp_price'] = True
+            await message.answer(f"✅ Мин. цена: {value}₽\nТеперь введи *максимальную цену*:", parse_mode="Markdown")
+        else:
+            user_settings[user_id]['max_price'] = value
+            del user_settings[user_id]['temp_price']
+            await message.answer(
+                f"✅ Диапазон установлен: {user_settings[user_id]['min_price']} - {user_settings[user_id]['max_price']} ₽\n"
+                f"🔍 Напиши /start для главного меню"
+            )
+    
+    # Фоновая проверка
+    async def background_check():
+        while True:
+            try:
+                for user_id, settings in user_settings.items():
+                    if 'temp_price' not in settings:
+                        await check_all_for_user(user_id, settings['min_price'], settings['max_price'])
+                    await asyncio.sleep(10)
+            except Exception as e:
+                logger.error(f"Фоновая ошибка: {e}")
+            await asyncio.sleep(CHECK_INTERVAL)
+    
     # Запускаем фоновую проверку
-    asyncio.create_task(background_check())
-    
-    # Запускаем polling
-    from aiogram.utils import executor
-    executor.start_polling(dp, skip_updates=True)
-
-if __name__ == "__main__":
-    # Запускаем Flask в отдельном потоке для health check
-    from threading import Thread
-    def run_flask():
-        app.run(host='0.0.0.0', port=PORT, debug=False)
-    
-    flask_thread = Thread(target=run_flask, daemon=True)
-    flask_thread.start()
+    loop.create_task(background_check())
     
     # Запускаем бота
-    loop = asyncio.get_event_loop()
-    loop.create_task(background_check())
+    logger.info("🚀 Бот запущен!")
     executor.start_polling(dp, skip_updates=True)
+
+# ========== FLASK (ОСНОВНОЙ ПОТОК) ==========
+@flask_app.route('/')
+def index():
+    return jsonify({
+        "status": "ok",
+        "bot": "running",
+        "users": len(user_settings),
+        "notifications": len(notified_products)
+    }), 200
+
+@flask_app.route('/health')
+def health():
+    return jsonify({"status": "alive", "timestamp": datetime.now().isoformat()}), 200
+
+if __name__ == "__main__":
+    logger.info(f"🔥 Запуск на порту {PORT}")
+    
+    # Запускаем бота в отдельном потоке
+    bot_thread = threading.Thread(target=run_bot, daemon=True)
+    bot_thread.start()
+    
+    # Ждём 2 секунды для запуска бота
+    time.sleep(2)
+    
+    # Запускаем Flask в ОСНОВНОМ потоке (Render увидит порт!)
+    flask_app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
