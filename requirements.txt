@@ -1,2 +1,5 @@
-requests
-flask
+aiogram==2.25.1
+selenium==4.15.0
+beautifulsoup4==4.12.2
+lxml==4.9.3
+flask==2.3.3
