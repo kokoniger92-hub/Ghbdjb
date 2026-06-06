@@ -1,4 +1,2 @@
 aiogram==2.25.1
-beautifulsoup4==4.12.2
-lxml==4.9.3
 flask==2.3.3
