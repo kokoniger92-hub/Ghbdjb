@@ -8,18 +8,17 @@ RUN apt-get update && apt-get install -y \
     gnupg \
     && rm -rf /var/lib/apt/lists/*
 
-# Устанавливаем переменные для Chrome
 ENV CHROME_BIN=/usr/bin/chromium
 ENV CHROMEDRIVER_PATH=/usr/bin/chromedriver
 
 WORKDIR /app
 
-# Копируем и устанавливаем зависимости
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Копируем приложение
 COPY app.py .
 
-# Запускаем
+# Важно: указываем порт для Render
+ENV PORT=10000
+
 CMD ["python", "app.py"]
