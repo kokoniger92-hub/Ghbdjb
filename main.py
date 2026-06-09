@@ -1,7 +1,6 @@
 import os
 import logging
 import asyncio
-import json
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
@@ -890,14 +889,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_states[user.id] = {"action": "order", "step": "quantity", "type": proxy_type}
         await query.edit_message_text(
             f"📦 Тип: *{proxy_type}*\n\nВведите количество (от 1 до 100):",
-            parse_mode='Markdown'
-        )
-    
-    elif data.startswith("country_"):
-        country = data.split("_")[1]
-        user_states[user.id] = {"action": "order", "step": "country", "type": country}
-        await query.edit_message_text(
-            f"🌍 Страна: *{country}*\n\nВведите название страны:",
             parse_mode='Markdown'
         )
 
